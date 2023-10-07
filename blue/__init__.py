@@ -3,13 +3,19 @@
 Some folks like black but I prefer blue.
 """
 
+import configparser
+import contextlib
 import logging
 import re
 import sys
 
+
 from importlib import machinery
 
 __version__ = '0.9.1'
+
+
+SUPPORTED_CONFIG_FILES = ('setup.cfg', 'tox.ini', '.blue')
 
 
 # Black 1.0+ ships pre-compiled libraries with mypyc, which we can't
@@ -70,7 +76,7 @@ import black.strings
 from black import Leaf, Path, click, token
 from black.cache import user_cache_dir
 from black.comments import ProtoComment, make_comment
-from black.files import tomli
+from black.files import tomli, find_user_pyproject_toml
 from black.linegen import LineGenerator as BlackLineGenerator
 from black.lines import Line
 from black.nodes import (
@@ -85,9 +91,6 @@ from black.strings import (
     normalize_string_prefix,
     sub_twice,
 )
-
-from flake8.options import config as flake8_config
-from flake8.options import manager as flake8_manager
 
 from enum import Enum
 from functools import lru_cache
@@ -393,21 +396,33 @@ def format_file_in_place(*args, **kws):
     return black_format_file_in_place(*args, **kws)
 
 
-try:
-    BaseConfigParser = flake8_config.ConfigParser              # flake8 v4
-except AttributeError:
-    BaseConfigParser = flake8_config.MergedConfigParser        # flake8 v3
+def configs_in_path(path: Path):
+    return [path.joinpath(c) for c in SUPPORTED_CONFIG_FILES]
 
 
-class MergedConfigParser(BaseConfigParser):
-    def _parse_config(self, config_parser, parent=None):
-        """Skip option parsing in flake8's config parsing."""
-        config_dict = {}
-        for option_name in config_parser.options(self.program_name):
-            value = config_parser.get(self.program_name, option_name)
-            LOG.debug('Option "%s" has value: %r', option_name, value)
-            config_dict[option_name] = value
-        return config_dict
+def load_configs_from_file() -> Dict[str, Any]:
+    """Parses supported config files using configparser."""
+    current_path = Path('.').resolve()
+    filenames = configs_in_path(current_path)
+    parser = configparser.ConfigParser()
+    parser.read(filenames)
+    # Search for config files from the current path and its parents
+    for path in (current_path, *current_path.parents):
+        files_read = parser.read(configs_in_path(path))
+        # if config file was read, stop search
+        if len(files_read) > 0:
+            if parser.has_section('blue'):
+                return dict(parser.items('blue'))
+            return {}
+    # Config file not found yet
+    # As a last resort try using top-level user configuration for black
+    with contextlib.suppress(PermissionError):
+        top_level_full_path = find_user_pyproject_toml()
+        top_level_dir = top_level_full_path.parent
+        parser.read(configs_in_path(top_level_dir))
+    if parser.has_section('blue'):
+        return dict(parser.items('blue'))
+    return {}
 
 
 def read_configs(
@@ -416,12 +431,7 @@ def read_configs(
     """Read configs through the config param's callback hook."""
     # Use black's `read_pyproject_toml` for the default
     result = black.read_pyproject_toml(ctx, param, value)
-    # Use flake8's config file parsing to load setup.cfg, tox.ini, and .blue
-    # The parsing looks both in the project and user directories.
-    finder = flake8_config.ConfigFileFinder('blue')
-    manager = flake8_manager.OptionManager('blue', '0')
-    parser = MergedConfigParser(manager, finder)
-    config = parser.parse()
+    config = load_configs_from_file()
     # Merge the configs into Click's `default_map`.
     default_map: Dict[str, Any] = {}
     default_map.update(ctx.default_map or {})
